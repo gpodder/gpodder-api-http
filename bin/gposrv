@@ -1,0 +1,634 @@
+#!/usr/bin/env python3
+
+#
+# gPodder: Media and podcast aggregator
+# Copyright (c) 2005-2014 Thomas Perl and the gPodder Team
+#
+# gPodder is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3 of the License, or
+# (at your option) any later version.
+#
+# gPodder is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+import sys
+import os
+import logging
+import atexit
+import time
+
+import flask
+from flask import request
+from flask import json
+from werkzeug import exceptions
+
+# A poor man's argparse/getopt - but it works for our use case :)
+verbose = False
+for flag in ('-v', '--verbose'):
+    if flag in sys.argv:
+        sys.argv.remove(flag)
+        verbose = True
+        break
+
+gpodder_script = sys.argv[0]
+if os.path.islink(gpodder_script):
+    gpodder_script = os.readlink(gpodder_script)
+gpodder_dir = os.path.join(os.path.dirname(gpodder_script), '..', 'gpodder-core')
+prefix = os.path.abspath(os.path.normpath(gpodder_dir))
+
+src_dir = os.path.join(prefix, 'src')
+
+if os.path.exists(os.path.join(src_dir, 'gpodder', '__init__.py')):
+    # Run gPodder from local source folder (not installed)
+    sys.path.insert(0, src_dir)
+
+import gpodder
+from gpodder import core
+from gpodder import opml
+from gpodder import util
+from gpodder import registry
+from gpodder import download
+
+httpd = flask.Flask(__name__)
+httpd.debug = True
+
+def jsonresp(response="", status=200, msg="OK"):
+    indent = None
+    if (flask.current_app.config['JSONIFY_PRETTYPRINT_REGULAR'] and
+            not request.is_xhr):
+        indent = 2
+    jsoncontent = json.dumps({"status": status, "msg": msg,
+                              "response": response}, indent=indent)
+    return flask.current_app.response_class(jsoncontent, status=status,
+        mimetype='application/json')
+
+@httpd.errorhandler(exceptions.HTTPException)
+def http_handler(error):
+    return jsonresp(status=error.code, msg="{name}: {desc}".format(
+        name=error.name, desc=error.description))
+
+class GpoApi(object):
+    COLUMNS = 80
+    EXIT_COMMANDS = ('quit', 'exit', 'bye')
+
+    def __init__(self, verbose=False):
+        self.core = core.Core(verbose=verbose)
+        self._db = self.core.db
+        self._config = self.core.config
+        self._model = self.core.model
+        self._queue = download.DownloadQueueManager(self.core.config)
+
+    # -------------------------------------------------------------------
+
+    def _all_podcasts(self):
+        """Returns a list of all Podcasts"""
+        return self._model.get_podcasts()
+
+    def _all_episodes(self):
+        """Returns a list of all Episodes"""
+        episodes = []
+        for podcast in self._model.get_podcasts():
+            for episode in podcast.episodes:
+                episodes.append(episode)
+        return episodes
+
+    def _get_podcast_id(self, podcast_id):
+        """Returns the podcast with the given id"""
+        for podcast in self._all_podcasts():
+            if podcast.id == podcast_id:
+                return podcast
+
+        raise exceptions.NotFound(
+            "Podcast-ID {} not found".format(podcast_id))
+
+    def _get_podcasts_id(self, podcast_ids):
+        """Returns a list of podcasts with the given ids"""
+        missing_ids = list(podcast_ids)
+        podcasts = []
+        for podcast in self._all_podcasts():
+            if podcast.id in podcast_ids:
+                podcasts.append(podcast)
+                missing_ids.remove(podcast.id)
+
+        if missing_ids:
+            raise exceptions.NotFound("Podcast-IDs {} not found".format(
+                self._join_ids(missing_ids)))
+        else:
+            return podcasts
+
+    def _get_podcast_url(self, url, check_only=False):
+        """Returns the podcast with the given id"""
+        url = self.core.model.normalize_feed_url(url)
+        for podcast in self._model.get_podcasts():
+            if podcast.url == url:
+                return podcast
+
+        if not check_only:
+            raise exceptions.NotFound("Not subscribed to {url}".format(
+                url=url))
+        else:
+            return None
+
+    def _get_episode(self, episode_id, check_only=False):
+        """Returns the episode with the given id"""
+        for podcast in self._model.get_podcasts():
+            for episode in podcast.episodes:
+                if episode.id == episode_id:
+                    return episode
+        if not check_only:
+            raise exceptions.NotFound("Episode-ID {} not found".format(
+                episode_id))
+        else:
+            return None
+
+    def _get_episodes(self, episode_ids):
+        """Returns a list of episodes with the give ids"""
+        missing_ids = list(episode_ids)
+        episodes = []
+        for podcast in self._model.get_podcasts():
+            for episode in podcast.episodes:
+                if episode.id in missing_ids:
+                    episodes.append(episode)
+                    missing_ids.remove(episode.id)
+
+        if missing_ids:
+            raise exceptions.NotFound("Episode-IDs {} not found".format(
+                self._join_ids(missing_ids)))
+        else:
+            return episodes
+
+    # -------------------------------------------------------------------
+
+    def _podcast_properties(self, podcast):
+        """Returns a dictionary with all podcast properties"""
+        return {"id": podcast.id,
+                "url": podcast.url,
+                "title": podcast.title,
+                "link": podcast.link,
+                "description": podcast.description,
+                "cover_url": podcast.cover_url,
+                "payment_url": podcast.payment_url,
+                "http_last_modified": podcast.http_last_modified,
+                "http_etag": podcast.http_etag,
+                "auto_archive_episodes": podcast.auto_archive_episodes,
+                "download_folder": podcast.download_folder,
+                "pause_subscription": podcast.pause_subscription,
+                "section": podcast.section,
+                "download_strategy": podcast.download_strategy}
+
+    def _episode_properties(self, episode):
+        """Return a dictionary with all episode properties"""
+        return {"id": episode.id,
+                "podcast_id": episode.podcast_id,
+                "url": episode.url,
+                "title": episode.title,
+                "file_size": episode.file_size,
+                "mime_type": episode.mime_type,
+                "guid": episode.guid,
+                "description": episode.description,
+                "link": episode.link,
+                "published": episode.published,
+                "downloading": episode.downloading,
+                "download_filename": episode.download_filename,
+                "download_progress": episode.download_progress(),
+                "payment_url": episode.payment_url,
+                "state": episode.state,
+                "is_new": episode.is_new,
+                "archive": episode.archive,
+                "total_time": episode.total_time,
+                "current_position": episode.current_position,
+                "last_playback": episode.last_playback}
+
+    def _prop_dict(self, object_list, prop_function, values=None):
+        """Returns a dictionary with the requested properties of each 
+           podcast or episode"""
+        object_dict = {}
+        for obj in object_list:
+            obj_prop = prop_function(obj)
+            if values == None:
+                prop_dict = obj_prop
+            else:
+                prop_dict = {}
+                for value in values:
+                    if value in obj_prop:
+                        prop_dict[value] = obj_prop[value]
+                    else:
+                        raise exceptions.BadRequest(
+                            "Property not found: {}".format(value))
+            object_dict[obj.id] = prop_dict
+        return object_dict
+    
+    def _podcast_dict(self, podcast_list, values=None):
+        """Calls the _prop_dict function for a list of podcasts"""
+        return self._prop_dict(podcast_list, self._podcast_properties, values)
+    
+    def _episode_dict(self, episode_list, values=None):
+        """Calls the _prop_dict function for a list of episodes"""
+        return self._prop_dict(episode_list, self._episode_properties, values)
+
+    # -------------------------------------------------------------------
+
+    def _create_podcast(self, url):
+        """Creates a podcast channel from an url and adds it to the 
+           podcast model"""
+        url = self.core.model.normalize_feed_url(url)
+        return self._model.load_podcast(url, create=True)
+
+    def _update_podcast(self, podcast):
+        """Updates the podcasts with the given ids"""
+        try:
+            update_status = podcast.update()
+            return update_status
+        except Exception:
+            return None
+
+    def _subscribe(self, url, title=None):
+        """Subscribes to a podcast url"""
+        existing = self._get_podcast_url(url, check_only=True)
+        if existing is not None:
+            raise exceptions.BadRequest(
+                "Already subscribed to {url}".format(url=existing.url))
+
+        try:
+            podcast = self._create_podcast(url)
+            if podcast is None:
+                raise exceptions.InternalServerError(
+                    "Subscription to {url} failed".format(url=url))
+
+            if title is not None:
+                podcast.rename(title)
+            podcast.save()
+
+            return podcast
+        except Exception as e:
+            logger.warn('Cannot subscribe: %s', e, exc_info=True)
+            raise exceptions.InternalServerError(
+                getattr(e, 'strerror', str(e)))
+
+    def _download_episode(self, episode):
+        """Creates a download task from an episode and adds it to the
+           download queue"""
+        task = download.DownloadTask(episode)
+        task.status = download.DownloadTask.QUEUED
+        self._queue.add_task(task, force_start=False)
+
+    # -------------------------------------------------------------------
+
+    def _parse_arg(self, name, conv=None, optional=False, single=False):
+        """Parses an argument and can converts its values using a
+           passed conv function"""
+        if name not in request.args:
+            if not optional:
+                raise exceptions.BadRequest(
+                    "{} argument is missing".format(name))
+            else:
+                return None
+
+        arg_string = request.args.get(name)
+        arg_list = []
+        for split_string in arg_string.split(","):
+            if conv is None:
+                arg_list.append(split_string)
+            else:
+                try:
+                    arg_list.append(conv(split_string))
+                except ValueError:
+                    raise exceptions.BadRequest(
+                        "Invalid argument type {}".format(split_string))
+
+        if single:
+            return arg_list[0]
+        else:
+            return arg_list
+
+    def _join_ids(self, ids):
+        """Joins all passed ids to a comma seperated string"""
+        return ", ".join(str(x) for x in ids)
+
+    def _atexit(self):
+        """Saves the config, db and shuts the core down"""
+        self.core.shutdown()
+
+    # -------------------------------------------------------------------
+
+    def podcasts(self):
+        pod_ids = self._parse_arg("id", int, optional=True)
+        req_prop = self._parse_arg("prop", None, optional=True)
+        if pod_ids is not None:
+            podcasts = self._get_podcasts_id(pod_ids)
+        else:
+            podcasts = self._all_podcasts()
+        return jsonresp(self._podcast_dict(podcasts, req_prop))
+
+    def auth(self):
+        pod_ids = self._parse_arg("id", int)
+        response_dict = {}
+        for podcast in self._get_podcasts_id(pod_ids):
+            response_dict[podcast.id] = {
+                "auth_username": podcast.auth_username,
+                "auth_password": podcast.auth_password}
+        return jsonresp(response_dict)
+
+    def subscribe(self):
+        url_arg = self._parse_arg("url", single=True)
+        url = self.core.model.normalize_feed_url(url_arg)
+        title = self._parse_arg("title", optional=True, single=True)
+
+        podcast = self._subscribe(url, title)
+        podcast.save()
+        return jsonresp(self._podcast_dict([podcast]),
+            msg="Resolved feed URL: {url}".format(url=podcast.url))
+
+    def unsubscribe(self):
+        pod_ids = self._parse_arg("id", int)
+
+        podcasts = self._get_podcasts_id(pod_ids)
+        for podcast in podcasts:
+            podcast.unsubscribe()
+        return jsonresp()
+
+    def enable(self):
+        pod_ids = self._parse_arg("id", int)
+        podcasts = self._get_podcasts_id(pod_ids)
+
+        for podcast in podcasts:
+            if podcast.pause_subscription:
+                podcast.pause_subscription = False
+                podcast.save()
+        
+        return jsonresp(self._podcast_dict(podcasts, ["pause_subscription"]))
+
+    def disable(self):
+        pod_ids = self._parse_arg("id", int)
+        podcasts = self._get_podcasts_id(pod_ids)
+
+        for podcast in podcasts:
+            if not podcast.pause_subscription:
+                podcast.pause_subscription = True
+                podcast.save()
+
+        return jsonresp(self._podcast_dict(podcasts, ["pause_subscription"]))
+
+    def update(self):
+        pod_ids = self._parse_arg("id", int, optional=True)
+        id_status = {"updated":[], "unchanged":[],
+                     "failed":[], "paused":[]}
+        if pod_ids is not None:
+            podcasts = self._get_podcasts_id(pod_ids)
+        else:
+            podcasts = self._all_podcasts()
+
+        for podcast in podcasts:
+            if not podcast.pause_subscription:
+                update_status = self._update_podcast(podcast)
+                if update_status == True:
+                    id_status["updated"].append(podcast.id)
+                elif update_status == False:
+                    id_status["unchanged"].append(podcast.id)
+                else:
+                    id_status["failed"].append(podcast.id)
+            else:
+                id_status["paused"].append(podcast.id)
+
+        return jsonresp(id_status)
+
+    def scan(self):
+        pod_ids = self._parse_arg("id", int, optional=True)
+        if pod_ids is not None:
+            podcasts = self._get_podcasts_id(pod_ids)
+        else:
+            podcasts = self._all_podcasts()
+
+        for podcast in podcasts:
+            podcast.check_download_folder()
+
+        return jsonresp()
+
+    def rewrite(self):
+        pod_id = self._parse_arg("id", int, single=True)
+
+        url_arg = self._parse_arg("url", single=True)
+        url = self.core.model.normalize_feed_url(url_arg)
+
+        podcast = self._get_podcast_id(pod_id)
+        old_url = podcast.url
+        new_url = podcast.rewrite_url(url)
+        podcast.save()
+        if new_url is None:
+            raise exceptions.BadRequest("Invalid URL: {}".format(url))
+        else:
+            return jsonresp(self._podcast_dict([podcast], ["url"]))
+
+    def rename(self):
+        pod_id = self._parse_arg("id", int, single=True)
+        title = self._parse_arg("title", single=True)
+
+        podcast = self._get_podcast_id(pod_id)
+        old_title = podcast.title
+        podcast.rename(title)
+        podcast.save()
+        return jsonresp(self._podcast_dict([podcast], ["title"]))
+
+    # -------------------------------------------------------------------
+
+    def episodes(self):
+        episode_ids = self._parse_arg("id", int, optional=True)
+        podcast_ids = self._parse_arg("podcast", int, optional=True)
+        req_prop = self._parse_arg("prop", None, optional=True)
+        episodes = []
+        if podcast_ids is not None:
+            for podcast in self._get_podcasts_id(podcast_ids):
+                episodes += podcast.episodes
+        if episode_ids is not None:
+            episodes += self._get_episodes(episode_ids)
+        if episode_ids is None and podcast_ids is None:
+            episodes = self._all_episodes()
+        return jsonresp(self._episode_dict(episodes, req_prop))
+
+    def download(self):
+        episode_ids = self._parse_arg("id", int)
+        episodes = self._get_episodes(episode_ids)
+
+        for episode in episodes:
+            self._download_episode(episode)
+        return jsonresp(self._episode_dict(episodes, ["downloading"]))
+
+    def cancel(self):
+        episode_ids = self._parse_arg("id", int)
+
+        episodes = self._get_episodes(episode_ids)
+        for episode in episodes:
+            if episode.downloading:
+                episode.download_task.cancel()
+
+        return jsonresp(self._episode_dict(episodes, ["state"]))
+
+    def remove(self):
+        episode_ids = self._parse_arg("id", int)
+        episodes = self._get_episodes(episode_ids)
+        for episode in episodes:
+            episode.delete()
+        return jsonresp()
+
+    def new(self):
+        episode_ids = self._parse_arg("id", int)
+        episodes = self._get_episodes(episode_ids)
+        changed_ids = []
+
+        for episode in episodes:
+            if not episode.is_new:
+                episode.is_new = True
+                changed_ids.append(episode.id)
+            if episode.is_new and episode.state == gpodder.STATE_DELETED:
+                episode.state = gpodder.STATE_NORMAL
+            episode.save()
+        return jsonresp(self._episode_dict(episodes, ["is_new"]))
+
+    def old(self):
+        episode_ids = self._parse_arg("id", int)
+        episodes = self._get_episodes(episode_ids)
+        changed_ids = []
+
+        for episode in episodes:
+            if episode.is_new:
+                episode.is_new = False
+                changed_ids.append(episode.id)
+            episode.save()
+        return jsonresp(self._episode_dict(episodes, ["is_new"]))
+    
+    def played(self):
+        episode_id = self._parse_arg("id", int, single=True)
+        position = self._parse_arg("position", int, single=True)
+        
+        now = time.time()
+        episode = self._get_episode(episode_id)
+        episode.current_position = position
+        episode.current_position_updated = now
+        episode.last_playback = now
+        episode.save()
+        return jsonresp(self._episode_dict([episode], 
+            ["total_time", "current_position", "last_playback"]))
+
+    # -------------------------------------------------------------------
+
+    def registry(self):
+        return jsonresp(registry.dump_dict())
+
+    def version(self):
+        up_to_date, latest_version, releasedate, __ = util.get_update_info()
+
+        info = {'latestversion': latest_version,
+                'latestdate': releasedate,
+                'url': gpodder.__url__,
+                'thisversion': gpodder.__version__,
+                'thisdate': gpodder.__date__}
+
+        return jsonresp(info)
+
+    def config(self):
+        config_dict = {}
+        for key in self._config.all_keys():
+            value = self._config._lookup(key)
+            config_dict[key] = value
+
+        return jsonresp(config_dict)
+
+    def set(self):
+        key = self._parse_arg("key", single=True)
+        value = self._parse_arg("value", single=True)
+
+        if key not in self._config.all_keys():
+            raise exceptions.BadRequest(
+                "Configuration option {key} not found".format(key=key))
+        else:
+            current_value = self._config._lookup(key)
+            current_type = type(current_value)
+        if current_type == dict:
+            raise exceptions.BadRequest(
+                "Invalid configuration option: {key}".format(key=key))
+
+        self._config.update_field(key, value)
+
+        return self.config()
+
+    def save(self):
+        self.core.save()
+        return jsonresp()
+
+    def importurl(self):
+        url_arg = self._parse_arg("url", single=True)
+        url = self.core.model.normalize_feed_url(url_arg)
+
+        for channel in opml.Importer(url).items:
+            self.subscribe(channel['url'], channel.get('title'))
+        return jsonresp()
+
+    def importfile(self):
+        opmlstring = request.files['file'].read()
+        for channel in opml.Importer(url=None, opmlstr=opmlstring).items:
+            self.subscribe(channel['url'], channel.get('title'))
+        return jsonresp()
+
+    def export(self):
+        podcasts = self._model.get_podcasts()
+        return flask.Response(
+            response=opml.Exporter().write(podcasts),
+            status=200,
+            mimetype="application/xml",
+            headers={"Content-Disposition":
+                     "attachment; filename=gpodder_export.opml"}
+            )
+
+    def files(self, episode_id):
+        episode = self._get_episode(episode_id, check_only=True)
+        if episode is None:
+            flask.abort(404)
+        filename = episode.download_filename
+        if filename is None:
+            flask.abort(404)
+        relpath = os.path.join(episode.parent.download_folder, filename)
+        return flask.send_from_directory(self.core.downloads, relpath,
+            as_attachment=True)
+
+
+def add_apiurls():
+    httpd.add_url_rule("/api/podcasts/", view_func=api.podcasts)
+    httpd.add_url_rule("/api/auth/", view_func=api.auth)
+    httpd.add_url_rule("/api/subscribe/", view_func=api.subscribe)
+    httpd.add_url_rule("/api/unsubscribe/", view_func=api.unsubscribe)
+    httpd.add_url_rule("/api/enable/", view_func=api.enable)
+    httpd.add_url_rule("/api/disable/", view_func=api.disable)
+    httpd.add_url_rule("/api/update/", view_func=api.update)
+    httpd.add_url_rule("/api/scan/", view_func=api.scan)
+    httpd.add_url_rule("/api/rewrite/", view_func=api.rewrite)
+    httpd.add_url_rule("/api/rename/", view_func=api.rename)
+    httpd.add_url_rule("/api/episodes/", view_func=api.episodes)
+    httpd.add_url_rule("/api/download/", view_func=api.download)
+    httpd.add_url_rule("/api/cancel/", view_func=api.cancel)
+    httpd.add_url_rule("/api/remove/", view_func=api.remove)
+    httpd.add_url_rule("/api/new/", view_func=api.new)
+    httpd.add_url_rule("/api/old/", view_func=api.old)
+    httpd.add_url_rule("/api/registry/", view_func=api.registry)
+    httpd.add_url_rule("/api/version/", view_func=api.version)
+    httpd.add_url_rule("/api/config/", view_func=api.config)
+    httpd.add_url_rule("/api/set/", view_func=api.set)
+    httpd.add_url_rule("/api/importurl/", view_func=api.importurl)
+    httpd.add_url_rule("/api/importfile/", view_func=api.importfile,
+        methods=["POST"])
+    httpd.add_url_rule("/api/export/", view_func=api.export)
+    httpd.add_url_rule("/api/save/", view_func=api.save)
+    httpd.add_url_rule("/files/<int:episode_id>/", view_func=api.files)
+
+if __name__ == '__main__':
+    logger = logging.getLogger(__name__)
+    api = GpoApi(verbose)
+    #atexit.register(api._atexit)
+    add_apiurls()
+    httpd.run()

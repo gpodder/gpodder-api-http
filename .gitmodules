@@ -1,0 +1,3 @@
+[submodule "gpodder-core"]
+	path = gpodder-core
+	url = git://github.com/gpodder/gpodder-core.git
