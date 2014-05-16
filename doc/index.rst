@@ -1,8 +1,3 @@
-.. gPodder HTTP-API documentation master file, created by
-   sphinx-quickstart on Sun Apr  6 23:26:21 2014.
-   You can adapt this file completely to your liking, but it should at least
-   contain the root ``toctree`` directive.
-
 Response Format
 ===============
 All responses have 3 top level keys:
@@ -107,8 +102,12 @@ An empty response is returned by methods which only execute task to check if err
       "status": 200
     }
 
-Argument Format
-===============
+Request Format
+==============
+
+Arguments
+---------
+
 All arguments are passed using http queries. A plus indicates that multiple values may be passed, seperated using ",".
 :Example: "id=1,2,3,5,7".
 
@@ -122,6 +121,10 @@ Common Arguments:
 * **key** - Config key
 * **value** - Config value
 
+Authentication
+--------------
+
+The authentication is done using the HTTP authorization header. The users are currently defined using the AUTH variable in the gposrv file. 
 
 Podcast Methods
 ===============
@@ -131,49 +134,49 @@ Podcast Methods
 
 :Description: Returns a list of all or the requested podcast channels
 :Arguments: [id+], [prop]
-:Example: ``http://localhost:5000/api/podcasts/``
+:Example: ``https://localhost:9807/api/podcasts/``
 :Response: PodcastDict of all podcasts
 
 /api/auth
 ---------
 :Description: Returns the authentication data
 :Arguments: id+
-:Example: ``http://localhost:5000/api/auth/?id=3``
+:Example: ``https://localhost:9807/api/auth/?id=3``
 :Response: PodcastDict with the "auth_username" and "auth_password" property only
 
 /api/subscribe
 --------------
 :Description: Subscribes to the given url and optionally sets the title
 :Arguments: url, title
-:Example: ``http://localhost:5000/api/subscribe/?url=http%3A%2F%2Fexample.com%2Fpodcast%2Fpodcast.xml&title=Podcast``
+:Example: ``https://localhost:9807/api/subscribe/?url=http%3A%2F%2Fexample.com%2Fpodcast%2Fpodcast.xml&title=Podcast``
 :Response: PodcastDict
 
 /api/unsubscribe
 ----------------
 :Description: Unsubscribes a podcast
 :Arguments: id+
-:Example: ``http://localhost:5000/api/unsubscribe/?id=3,4``
+:Example: ``https://localhost:9807/api/unsubscribe/?id=3,4``
 :Response: Empty Response
 
 /api/enable
 -----------
 :Description: Tries to enable the given podcasts and returns the enabled and skipped (already enabled) podcasts
 :Arguments: id+
-:Example: ``http://localhost:5000/api/enable/?id=1,2``
+:Example: ``https://localhost:9807/api/enable/?id=1,2``
 :Response: PodcastDict with the "pause_subscription" property only
 
 /api/disable
 ------------
 :Description: Tries to disable the given podcast and returns the disabled and skipped (already disabled) podcasts
 :Arguments: id+
-:Example: ``http://localhost:5000/api/disable/?id=1,2``
+:Example: ``https://localhost:9807/api/disable/?id=1,2``
 :Response: PodcastDict with the "pause_subscription" property only
 
 /api/update
 -----------
 :Description: Updates the given podcast or all podcasts
 :Arguments: [id+]
-:Example: ``http://localhost:5000/api/update/``
+:Example: ``https://localhost:9807/api/update/``
 :Response:
 
 .. code-block:: json
@@ -193,25 +196,18 @@ Podcast Methods
       "status": 200
     }
 
-/api/scan
----------
-:Description: Scans the podcast directory for downloaded episodes, it's recommended to call /api/episodes afterwards
-:Arguments: [id+]
-:Example: ``http://localhost:5000/api/scan/?id=1``
-:Response: Empty response
-
 /api/rewrite
 ------------
 :Description: Changes the url of an existing podcast
 :Arguments: id, url
-:Example: ``http://localhost:5000/api/rewrite/?id=4&url=http%3A%2F%2Fexample.com%2Fnewurl%2Fpodcast.xml``
+:Example: ``https://localhost:9807/api/rewrite/?id=4&url=http%3A%2F%2Fexample.com%2Fnewurl%2Fpodcast.xml``
 :Response: PodcastDict with the "url" property only
 
 /api/rename
 -----------
 :Description: Changes the name of an existing podcast
 :Arguments: id, title
-:Example: ``http://localhost:5000/api/rename/?id=4&title=Podcast1``
+:Example: ``https://localhost:9807/api/rename/?id=4&title=Podcast1``
 :Response: PodcastDict with the "title" property only
 
 
@@ -222,50 +218,50 @@ Episode Methods
 -------------
 :Description: Returns the properties for single episodes, all episodes of a podcast or all episodes in the database.
 :Arguments: [id+], [podcast+], [prop+]
-:Examples: ``http://localhost:5000/api/episodes/?id=101,102&podcast=1,2&prop=title,url,total_time,is_new
-             http://localhost:5000/api/episodes/``
+:Examples: ``https://localhost:9807/api/episodes/?id=101,102&podcast=1,2&prop=title,url,total_time,is_new
+             https://localhost:9807/api/episodes/``
 :Response: EpisodesDict with the requested properties
 
 /api/download
 -------------
 :Description: Downloads the given episodes
 :Arguments: [id+]
-:Example: ``http://localhost:5000/api/download/?id=7``
+:Example: ``https://localhost:9807/api/download/?id=7``
 :Response: EpisodesDict with the "downloading" property only
 
 /api/cancel
 -----------
 :Description: Cancels a download task
 :Arguments: id+
-:Example: ``http://localhost:5000/api/cancel/?id=8,9``
+:Example: ``https://localhost:9807/api/cancel/?id=8,9``
 :Response: EpisodesDict with the "state" property only
 
 /api/remove
 -----------
 :Description: Deletes the given episodes
 :Arguments: id+
-:Example: ``http://localhost:5000/api/remove/?id=6,7``
+:Example: ``https://localhost:9807/api/remove/?id=6,7``
 :Response: Empty response
 
 /api/new
 --------
 :Description: Marks the given episodes as new
 :Arguments: id+
-:Example: ``http://localhost:5000/api/new/?id=3,4``
+:Example: ``https://localhost:9807/api/new/?id=3,4``
 :Response: EpisodesDict with the "is_new" property only
 
 /api/old
 --------
 :Description: Marks the given episode as old
 :Arguments: id+
-:Example: ``http://localhost:5000/api/old/?id=3,4``
+:Example: ``https://localhost:9807/api/old/?id=3,4``
 :Response: EpisodesDict with the "is_new" property only
 
 /api/played
 -----------
 :Description: Sets the playback position of an episode
 :Arguments: id, position
-:Example: ``http://localhost:5000/api/played/?id=1&position=1392``
+:Example: ``https://localhost:9807/api/played/?id=1&position=1392``
 :Response: EpisodeDict with the "total_time", "current_position" and "last_playback" properties only
 
 Other methods
@@ -275,7 +271,7 @@ Other methods
 -------------
 :Description: Dumps the registry
 :Arguments: none
-:Example: ``http://localhost:5000/api/registry``
+:Example: ``https://localhost:9807/api/registry``
 :Response:
 
 .. code-block:: json
@@ -349,7 +345,7 @@ Other methods
 ------------
 :Description: Returns the currently installed and latest version of gPodder
 :Arguments: none
-:Example: ``http://localhost:5000/api/version/``
+:Example: ``https://localhost:9807/api/version/``
 :Response:
 
 .. code-block:: json
@@ -370,7 +366,7 @@ Other methods
 -----------
 :Description: Dumps the config
 :Arguments: none
-:Example: ``http://localhost:5000/api/config/``
+:Example: ``https://localhost:9807/api/config/``
 :Response:
 
 .. code-block:: json
@@ -401,42 +397,49 @@ Other methods
 --------
 :Description: Sets a config value
 :Arguments: key, value
-:Example: ``http://localhost:5000/api/set/?key=limit.bandwidth.kbps&value=1000.0``
+:Example: ``https://localhost:9807/api/set/?key=limit.bandwidth.kbps&value=1000.0``
 :Response: same as /api/config
 
 /api/save
 ---------
 :Description: Saves the config and db
 :Arguments: none
-:Example: ``http://localhost:5000/api/save``
+:Example: ``https://localhost:9807/api/save``
 :Response: Empty response
 
 /api/importurl
 --------------
 :Description: Imports an opml file from the given url
 :Arguments: url
-:Example: ``http://localhost:5000/api/importurl/?url=http%3A%2F%2Fexample.com%2Fpodcast%2Fpodcasts.opml``
+:Example: ``https://localhost:9807/api/importurl/?url=http%3A%2F%2Fexample.com%2Fpodcast%2Fpodcasts.opml``
 :Response: Empty response
 
 /api/importfile
 ---------------
 :Description: Imports an uploaded opml file
 :Arguments: none, you have to upload the file using a push request
-:Example: ``curl -X POST -d @podcasts.opml http://localhost:5000/api/importfile``
+:Example: ``curl -X POST -d @podcasts.opml https://localhost:9807/api/importfile``
 :Response: Empty response
 
 /api/export
 -----------
 :Description: Exports all subscriptions as an opml file
 :Arguments: none
-:Example: ``http://localhost:5000/api/export/``
-:Response: opml content, no json response!
+:Example: ``https://localhost:9807/api/export/``
+:Response: Opml content, no json response!
 
-/files/episode_id
+/api/save
+-----------
+:Description: Saves the current core state
+:Arguments: none
+:Example: ``https://localhost:9807/api/save/``
+:Response: Empty response
+
+/files
 -----------------
 :Description: Method for accessing the downloaded file of an episode
-:Arguments: none, use the episode_id argument in the url
-:Example: ``http://localhost:5000/files/12``
+:Arguments: id
+:Example: ``https://localhost:9807/files/12``
 :Response: Media file of the requested episode, no json response!
 
 Indices and tables
