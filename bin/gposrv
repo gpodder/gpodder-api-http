@@ -18,29 +18,33 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 
+SERVER_ADDRESS = ("localhost", 9807)
+SSL = True
+# The hash is generated using hashlib.sha256(b"user:password").hexdigest()
+AUTH = {"gpodder": "e9a0061df8abac377bf453616531baf1d223493e70a05ea8293c5d38c41da911",
+        "admin": "bb1fb0facf769d730600254116a5ccce4a6c0f1756788fda142f063cd1802aa3"}
+
 import sys
 import os
 import logging
-import atexit
+import traceback
 import time
+import json
+import base64
+import binascii
+import shutil
+import hashlib
 
-import flask
-from flask import request
-from flask import json
-from werkzeug import exceptions
-
-# A poor man's argparse/getopt - but it works for our use case :)
-verbose = False
-for flag in ('-v', '--verbose'):
-    if flag in sys.argv:
-        sys.argv.remove(flag)
-        verbose = True
-        break
+import ssl
+import http.server
+import socketserver
+import urllib.parse
 
 gpodder_script = sys.argv[0]
 if os.path.islink(gpodder_script):
     gpodder_script = os.readlink(gpodder_script)
-gpodder_dir = os.path.join(os.path.dirname(gpodder_script), '..', 'gpodder-core')
+script_dir = os.path.dirname(gpodder_script)
+gpodder_dir = os.path.join(script_dir, '..', 'gpodder-core')
 prefix = os.path.abspath(os.path.normpath(gpodder_dir))
 
 src_dir = os.path.join(prefix, 'src')
@@ -56,34 +60,35 @@ from gpodder import util
 from gpodder import registry
 from gpodder import download
 
-httpd = flask.Flask(__name__)
-httpd.debug = True
+# A poor man's argparse/getopt - but it works for our use case :)
+verbose = False
+for flag in ('-v', '--verbose'):
+    if flag in sys.argv:
+        sys.argv.remove(flag)
+        verbose = True
+        break
 
-def jsonresp(response="", status=200, msg="OK"):
-    indent = None
-    if (flask.current_app.config['JSONIFY_PRETTYPRINT_REGULAR'] and
-            not request.is_xhr):
-        indent = 2
+def jsonresp(response="", status=200, msg=None, headers=None):
+    if not msg:
+        msg = None
+    if not headers:
+        respheaders = {"Content-Type": "application/json; charset=utf-8"}
+    else:
+        respheaders = {"Content-Type": "application/json; charset=utf-8"}
+        respheaders.update(headers)
     jsoncontent = json.dumps({"status": status, "msg": msg,
-                              "response": response}, indent=indent)
-    return flask.current_app.response_class(jsoncontent, status=status,
-        mimetype='application/json')
-
-@httpd.errorhandler(exceptions.HTTPException)
-def http_handler(error):
-    return jsonresp(status=error.code, msg="{name}: {desc}".format(
-        name=error.name, desc=error.description))
+        "response": response}, indent=2).encode('utf-8')
+    return {"content": jsoncontent, "status": status, "msg": msg,
+            "headers": respheaders}
 
 class GpoApi(object):
-    COLUMNS = 80
-    EXIT_COMMANDS = ('quit', 'exit', 'bye')
 
     def __init__(self, verbose=False):
         self.core = core.Core(verbose=verbose)
         self._db = self.core.db
         self._config = self.core.config
         self._model = self.core.model
-        self._queue = download.DownloadQueueManager(self.core.config)
+        self._queue = download.DownloadQueueManager(self._config)
 
     # -------------------------------------------------------------------
 
@@ -105,7 +110,7 @@ class GpoApi(object):
             if podcast.id == podcast_id:
                 return podcast
 
-        raise exceptions.NotFound(
+        raise ServerError(404, 
             "Podcast-ID {} not found".format(podcast_id))
 
     def _get_podcasts_id(self, podcast_ids):
@@ -118,7 +123,7 @@ class GpoApi(object):
                 missing_ids.remove(podcast.id)
 
         if missing_ids:
-            raise exceptions.NotFound("Podcast-IDs {} not found".format(
+            raise ServerError(404, "Podcast-IDs {} not found".format(
                 self._join_ids(missing_ids)))
         else:
             return podcasts
@@ -131,7 +136,7 @@ class GpoApi(object):
                 return podcast
 
         if not check_only:
-            raise exceptions.NotFound("Not subscribed to {url}".format(
+            raise ServerError(404, "Not subscribed to {url}".format(
                 url=url))
         else:
             return None
@@ -143,7 +148,7 @@ class GpoApi(object):
                 if episode.id == episode_id:
                     return episode
         if not check_only:
-            raise exceptions.NotFound("Episode-ID {} not found".format(
+            raise ServerError(404, "Episode-ID {} not found".format(
                 episode_id))
         else:
             return None
@@ -159,7 +164,7 @@ class GpoApi(object):
                     missing_ids.remove(episode.id)
 
         if missing_ids:
-            raise exceptions.NotFound("Episode-IDs {} not found".format(
+            raise ServerError(404, "Episode-IDs {} not found".format(
                 self._join_ids(missing_ids)))
         else:
             return episodes
@@ -203,6 +208,7 @@ class GpoApi(object):
                 "is_new": episode.is_new,
                 "archive": episode.archive,
                 "total_time": episode.total_time,
+                "chapters": episode.chapters,
                 "current_position": episode.current_position,
                 "last_playback": episode.last_playback}
 
@@ -220,7 +226,7 @@ class GpoApi(object):
                     if value in obj_prop:
                         prop_dict[value] = obj_prop[value]
                     else:
-                        raise exceptions.BadRequest(
+                        raise ServerError(400, 
                             "Property not found: {}".format(value))
             object_dict[obj.id] = prop_dict
         return object_dict
@@ -253,13 +259,13 @@ class GpoApi(object):
         """Subscribes to a podcast url"""
         existing = self._get_podcast_url(url, check_only=True)
         if existing is not None:
-            raise exceptions.BadRequest(
+            raise ServerError(400, 
                 "Already subscribed to {url}".format(url=existing.url))
 
         try:
             podcast = self._create_podcast(url)
             if podcast is None:
-                raise exceptions.InternalServerError(
+                raise ServerError(500, 
                     "Subscription to {url} failed".format(url=url))
 
             if title is not None:
@@ -269,7 +275,7 @@ class GpoApi(object):
             return podcast
         except Exception as e:
             logger.warn('Cannot subscribe: %s', e, exc_info=True)
-            raise exceptions.InternalServerError(
+            raise ServerError(500, 
                 getattr(e, 'strerror', str(e)))
 
     def _download_episode(self, episode):
@@ -280,28 +286,28 @@ class GpoApi(object):
         self._queue.add_task(task, force_start=False)
 
     # -------------------------------------------------------------------
-
-    def _parse_arg(self, name, conv=None, optional=False, single=False):
+    
+    def _parse_arg(self, query, name, conv=None, optional=False, single=False):
         """Parses an argument and can converts its values using a
            passed conv function"""
-        if name not in request.args:
+        if name not in query:
             if not optional:
-                raise exceptions.BadRequest(
-                    "{} argument is missing".format(name))
+                raise ServerError(400, "{} argument is missing".format(name))
             else:
                 return None
 
-        arg_string = request.args.get(name)
+        query_list = []
+        for part in query[name]:
+            query_list += part.split(",")
         arg_list = []
-        for split_string in arg_string.split(","):
+        for split_string in query_list:
             if conv is None:
                 arg_list.append(split_string)
             else:
                 try:
                     arg_list.append(conv(split_string))
                 except ValueError:
-                    raise exceptions.BadRequest(
-                        "Invalid argument type {}".format(split_string))
+                    raise ServerError(400, "Invalid argument type {}".format(split_string))
 
         if single:
             return arg_list[0]
@@ -318,17 +324,17 @@ class GpoApi(object):
 
     # -------------------------------------------------------------------
 
-    def podcasts(self):
-        pod_ids = self._parse_arg("id", int, optional=True)
-        req_prop = self._parse_arg("prop", None, optional=True)
+    def podcasts(self, request):
+        pod_ids = self._parse_arg(request.query, "id", int, optional=True)
+        req_prop = self._parse_arg(request.query, "prop", None, optional=True)
         if pod_ids is not None:
             podcasts = self._get_podcasts_id(pod_ids)
         else:
             podcasts = self._all_podcasts()
         return jsonresp(self._podcast_dict(podcasts, req_prop))
 
-    def auth(self):
-        pod_ids = self._parse_arg("id", int)
+    def auth(self, request):
+        pod_ids = self._parse_arg(request.query, "id", int)
         response_dict = {}
         for podcast in self._get_podcasts_id(pod_ids):
             response_dict[podcast.id] = {
@@ -336,26 +342,26 @@ class GpoApi(object):
                 "auth_password": podcast.auth_password}
         return jsonresp(response_dict)
 
-    def subscribe(self):
-        url_arg = self._parse_arg("url", single=True)
+    def subscribe(self, request):
+        url_arg = self._parse_arg(request.query, "url", single=True)
         url = self.core.model.normalize_feed_url(url_arg)
-        title = self._parse_arg("title", optional=True, single=True)
+        title = self._parse_arg(request.query, "title", optional=True, single=True)
 
         podcast = self._subscribe(url, title)
         podcast.save()
         return jsonresp(self._podcast_dict([podcast]),
             msg="Resolved feed URL: {url}".format(url=podcast.url))
 
-    def unsubscribe(self):
-        pod_ids = self._parse_arg("id", int)
+    def unsubscribe(self, request):
+        pod_ids = self._parse_arg(request.query, "id", int)
 
         podcasts = self._get_podcasts_id(pod_ids)
         for podcast in podcasts:
             podcast.unsubscribe()
         return jsonresp()
 
-    def enable(self):
-        pod_ids = self._parse_arg("id", int)
+    def enable(self, request):
+        pod_ids = self._parse_arg(request.query, "id", int)
         podcasts = self._get_podcasts_id(pod_ids)
 
         for podcast in podcasts:
@@ -365,8 +371,8 @@ class GpoApi(object):
         
         return jsonresp(self._podcast_dict(podcasts, ["pause_subscription"]))
 
-    def disable(self):
-        pod_ids = self._parse_arg("id", int)
+    def disable(self, request):
+        pod_ids = self._parse_arg(request.query, "id", int)
         podcasts = self._get_podcasts_id(pod_ids)
 
         for podcast in podcasts:
@@ -376,8 +382,8 @@ class GpoApi(object):
 
         return jsonresp(self._podcast_dict(podcasts, ["pause_subscription"]))
 
-    def update(self):
-        pod_ids = self._parse_arg("id", int, optional=True)
+    def update(self, request):
+        pod_ids = self._parse_arg(request.query, "id", int, optional=True)
         id_status = {"updated":[], "unchanged":[],
                      "failed":[], "paused":[]}
         if pod_ids is not None:
@@ -399,22 +405,10 @@ class GpoApi(object):
 
         return jsonresp(id_status)
 
-    def scan(self):
-        pod_ids = self._parse_arg("id", int, optional=True)
-        if pod_ids is not None:
-            podcasts = self._get_podcasts_id(pod_ids)
-        else:
-            podcasts = self._all_podcasts()
+    def rewrite(self, request):
+        pod_id = self._parse_arg(request.query, "id", int, single=True)
 
-        for podcast in podcasts:
-            podcast.check_download_folder()
-
-        return jsonresp()
-
-    def rewrite(self):
-        pod_id = self._parse_arg("id", int, single=True)
-
-        url_arg = self._parse_arg("url", single=True)
+        url_arg = self._parse_arg(request.query, "url", single=True)
         url = self.core.model.normalize_feed_url(url_arg)
 
         podcast = self._get_podcast_id(pod_id)
@@ -422,13 +416,13 @@ class GpoApi(object):
         new_url = podcast.rewrite_url(url)
         podcast.save()
         if new_url is None:
-            raise exceptions.BadRequest("Invalid URL: {}".format(url))
+            raise ServerError(400, "Invalid URL: {}".format(url))
         else:
             return jsonresp(self._podcast_dict([podcast], ["url"]))
 
-    def rename(self):
-        pod_id = self._parse_arg("id", int, single=True)
-        title = self._parse_arg("title", single=True)
+    def rename(self, request):
+        pod_id = self._parse_arg(request.query, "id", int, single=True)
+        title = self._parse_arg(request.query, "title", single=True)
 
         podcast = self._get_podcast_id(pod_id)
         old_title = podcast.title
@@ -438,10 +432,10 @@ class GpoApi(object):
 
     # -------------------------------------------------------------------
 
-    def episodes(self):
-        episode_ids = self._parse_arg("id", int, optional=True)
-        podcast_ids = self._parse_arg("podcast", int, optional=True)
-        req_prop = self._parse_arg("prop", None, optional=True)
+    def episodes(self, request):
+        episode_ids = self._parse_arg(request.query, "id", int, optional=True)
+        podcast_ids = self._parse_arg(request.query, "podcast", int, optional=True)
+        req_prop = self._parse_arg(request.query, "prop", None, optional=True)
         episodes = []
         if podcast_ids is not None:
             for podcast in self._get_podcasts_id(podcast_ids):
@@ -452,16 +446,16 @@ class GpoApi(object):
             episodes = self._all_episodes()
         return jsonresp(self._episode_dict(episodes, req_prop))
 
-    def download(self):
-        episode_ids = self._parse_arg("id", int)
+    def download(self, request):
+        episode_ids = self._parse_arg(request.query, "id", int)
         episodes = self._get_episodes(episode_ids)
 
         for episode in episodes:
             self._download_episode(episode)
         return jsonresp(self._episode_dict(episodes, ["downloading"]))
 
-    def cancel(self):
-        episode_ids = self._parse_arg("id", int)
+    def cancel(self, request):
+        episode_ids = self._parse_arg(request.query, "id", int)
 
         episodes = self._get_episodes(episode_ids)
         for episode in episodes:
@@ -470,15 +464,15 @@ class GpoApi(object):
 
         return jsonresp(self._episode_dict(episodes, ["state"]))
 
-    def remove(self):
-        episode_ids = self._parse_arg("id", int)
+    def remove(self, request):
+        episode_ids = self._parse_arg(request.query, "id", int)
         episodes = self._get_episodes(episode_ids)
         for episode in episodes:
             episode.delete()
         return jsonresp()
 
-    def new(self):
-        episode_ids = self._parse_arg("id", int)
+    def new(self, request):
+        episode_ids = self._parse_arg(request.query, "id", int)
         episodes = self._get_episodes(episode_ids)
         changed_ids = []
 
@@ -491,8 +485,8 @@ class GpoApi(object):
             episode.save()
         return jsonresp(self._episode_dict(episodes, ["is_new"]))
 
-    def old(self):
-        episode_ids = self._parse_arg("id", int)
+    def old(self, request):
+        episode_ids = self._parse_arg(request.query, "id", int)
         episodes = self._get_episodes(episode_ids)
         changed_ids = []
 
@@ -503,9 +497,9 @@ class GpoApi(object):
             episode.save()
         return jsonresp(self._episode_dict(episodes, ["is_new"]))
     
-    def played(self):
-        episode_id = self._parse_arg("id", int, single=True)
-        position = self._parse_arg("position", int, single=True)
+    def played(self, request):
+        episode_id = self._parse_arg(request.query, "id", int, single=True)
+        position = self._parse_arg(request.query, "position", int, single=True)
         
         now = time.time()
         episode = self._get_episode(episode_id)
@@ -517,11 +511,11 @@ class GpoApi(object):
             ["total_time", "current_position", "last_playback"]))
 
     # -------------------------------------------------------------------
-
-    def registry(self):
+    
+    def registry(self, request):
         return jsonresp(registry.dump_dict())
 
-    def version(self):
+    def version(self, request):
         up_to_date, latest_version, releasedate, __ = util.get_update_info()
 
         info = {'latestversion': latest_version,
@@ -532,7 +526,7 @@ class GpoApi(object):
 
         return jsonresp(info)
 
-    def config(self):
+    def config(self, request):
         config_dict = {}
         for key in self._config.all_keys():
             value = self._config._lookup(key)
@@ -540,95 +534,213 @@ class GpoApi(object):
 
         return jsonresp(config_dict)
 
-    def set(self):
-        key = self._parse_arg("key", single=True)
-        value = self._parse_arg("value", single=True)
+    def set(self, request):
+        key = self._parse_arg(request.query, "key", single=True)
+        value = self._parse_arg(request.query, "value", single=True)
 
         if key not in self._config.all_keys():
-            raise exceptions.BadRequest(
+            raise ServerError(400, 
                 "Configuration option {key} not found".format(key=key))
         else:
             current_value = self._config._lookup(key)
             current_type = type(current_value)
         if current_type == dict:
-            raise exceptions.BadRequest(
+            raise ServerError(400, 
                 "Invalid configuration option: {key}".format(key=key))
 
         self._config.update_field(key, value)
 
         return self.config()
 
-    def save(self):
+    def save(self, request):
         self.core.save()
         return jsonresp()
 
-    def importurl(self):
-        url_arg = self._parse_arg("url", single=True)
+    def importurl(self, request):
+        url_arg = self._parse_arg(request.query, "url", single=True)
         url = self.core.model.normalize_feed_url(url_arg)
 
         for channel in opml.Importer(url).items:
             self.subscribe(channel['url'], channel.get('title'))
         return jsonresp()
 
-    def importfile(self):
-        opmlstring = request.files['file'].read()
+    def importfile(self, request):
+        try:
+            opmlstring = request.rfile.read().decode("utf-8")
+        except UnicodeError:
+            raise ServerError(400, msg="Could not decode input file")
         for channel in opml.Importer(url=None, opmlstr=opmlstring).items:
             self.subscribe(channel['url'], channel.get('title'))
         return jsonresp()
 
-    def export(self):
+    def export(self, request):
         podcasts = self._model.get_podcasts()
-        return flask.Response(
-            response=opml.Exporter().write(podcasts),
-            status=200,
-            mimetype="application/xml",
-            headers={"Content-Disposition":
-                     "attachment; filename=gpodder_export.opml"}
-            )
+        opmlstr = opml.Exporter(None).write(podcasts)
+        return {
+            "content": opmlstr,
+            "status": 200,
+            "msg": "OK",
+            "headers": {"Content-Type": "application/xml; charset=utf-8",
+                "Content-Disposition": 
+                    "attachment; filename=gpodder_export.opml"
+                }
+            }
 
-    def files(self, episode_id):
-        episode = self._get_episode(episode_id, check_only=True)
-        if episode is None:
-            flask.abort(404)
-        filename = episode.download_filename
+    def files(self, request):
+        episode_id = episode_ids = self._parse_arg(request.query, "id", int, single=True)
+        episode = self._get_episode(episode_id)
+        filename = episode.local_filename(create=False)
         if filename is None:
-            flask.abort(404)
-        relpath = os.path.join(episode.parent.download_folder, filename)
-        return flask.send_from_directory(self.core.downloads, relpath,
-            as_attachment=True)
+            return jsonresp(status=404, msg="Episode {} not downloaded".format(episode_id))
+        f = open(filename, "rb")
+        try:
+            fs = os.fstat(f.fileno())
+            request.send_response(200)
+            request.send_header("Content-Type", episode.mime_type)
+            request.send_header("Content-Disposition", 
+                "attachment; filename={}".format(episode.download_filename))
+            request.end_headers()
+            shutil.copyfileobj(f, request.wfile)
+            return None
+        finally:
+            f.close()
 
 
-def add_apiurls():
-    httpd.add_url_rule("/api/podcasts/", view_func=api.podcasts)
-    httpd.add_url_rule("/api/auth/", view_func=api.auth)
-    httpd.add_url_rule("/api/subscribe/", view_func=api.subscribe)
-    httpd.add_url_rule("/api/unsubscribe/", view_func=api.unsubscribe)
-    httpd.add_url_rule("/api/enable/", view_func=api.enable)
-    httpd.add_url_rule("/api/disable/", view_func=api.disable)
-    httpd.add_url_rule("/api/update/", view_func=api.update)
-    httpd.add_url_rule("/api/scan/", view_func=api.scan)
-    httpd.add_url_rule("/api/rewrite/", view_func=api.rewrite)
-    httpd.add_url_rule("/api/rename/", view_func=api.rename)
-    httpd.add_url_rule("/api/episodes/", view_func=api.episodes)
-    httpd.add_url_rule("/api/download/", view_func=api.download)
-    httpd.add_url_rule("/api/cancel/", view_func=api.cancel)
-    httpd.add_url_rule("/api/remove/", view_func=api.remove)
-    httpd.add_url_rule("/api/new/", view_func=api.new)
-    httpd.add_url_rule("/api/old/", view_func=api.old)
-    httpd.add_url_rule("/api/registry/", view_func=api.registry)
-    httpd.add_url_rule("/api/version/", view_func=api.version)
-    httpd.add_url_rule("/api/config/", view_func=api.config)
-    httpd.add_url_rule("/api/set/", view_func=api.set)
-    httpd.add_url_rule("/api/importurl/", view_func=api.importurl)
-    httpd.add_url_rule("/api/importfile/", view_func=api.importfile,
-        methods=["POST"])
-    httpd.add_url_rule("/api/export/", view_func=api.export)
-    httpd.add_url_rule("/api/save/", view_func=api.save)
-    httpd.add_url_rule("/files/<int:episode_id>/", view_func=api.files)
+class ServerError(Exception):
+    def __init__(self, code, msg):
+        self.code = code
+        self.msg = msg
+    def __str__(self):
+        return "{name}: {desc}".format(
+            name=http.server.BaseHTTPRequestHandler.responses[self.code], 
+                desc=self.msg)
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    pass
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def call_api(self):
+        if self.auth():
+            for route in routes:
+                if self.path.startswith(route):
+                    func = routes[route]
+                    self.urlparse = urllib.parse.urlparse(self.path)
+                    self.query = urllib.parse.parse_qs(self.urlparse.query)
+                    self.respond(func(self))
+                    return
+        else:
+            self.respond(jsonresp(status=401, 
+                headers={"WWW-Authenticate": 'Basic realm="gpodder-api"'}))
+        self.respond(jsonresp(status=404, msg="API-Method does not exist"))
+
+    def errorhandler(self, exception):
+        if type(exception) == ServerError:
+            self.respond(jsonresp(status=exception.code, msg=str(exception)))
+        else:
+            self.respond(jsonresp(status=500, msg="{name}: {desc}".format(
+                name=type(exception).__name__, desc=str(exception))))
+            traceback.print_exc()
+    
+    def auth(self):
+        if "Authorization" not in self.headers:
+            return False
+        try:
+            authstr = self.headers["Authorization"].split()[-1]
+            unbase = base64.b64decode(authstr)
+            decoded = unbase.decode("utf-8")
+        except (UnicodeError, binascii.Error):
+            raise ServerError(403, "Could not decode authorization header")
+        
+        user = decoded.split(":", 1)[0]
+        pwdhash = hashlib.sha256(unbase).hexdigest()
+        
+        if user in AUTH and pwdhash == AUTH[user]:
+            return True
+        else:
+            return False
+    
+    def respond(self, response):
+        if response is None:
+            return
+        if "content" in response:
+            content = response["content"]
+        else:
+            self.respond(jsonresp(status=500, msg="Method did not return any data"))
+            return
+        if "status" in response:
+            status = response["status"]
+        else:
+            status = 200
+        if "msg" in response:
+            msg = response["msg"]
+        else:
+            msg = None
+        if "headers" in response:
+            headers = response["headers"]
+        else:
+            headers = {}
+        
+        self.send_response(status, msg)
+        for keyword, value in headers.items():
+            self.send_header(keyword, value)
+        self.end_headers()
+        self.wfile.write(content)
+    
+    def do_GET(self):
+        try:
+            self.call_api()
+        except Exception as error:
+            self.errorhandler(error)
+    
+    def do_POST(self):
+        try:
+            self.call_api()
+        except Exception as error:
+            self.errorhandler(error)
+
+routes = {}
+
+def add_route(func, path=None):
+    if path is None:
+        path = "/api/" + func.__name__
+    routes[path] = func
+
+def add_routes():
+    add_route(api.podcasts)
+    add_route(api.auth)
+    add_route(api.subscribe)
+    add_route(api.unsubscribe)
+    add_route(api.enable)
+    add_route(api.disable)
+    add_route(api.update)
+    add_route(api.scan)
+    add_route(api.rewrite)
+    add_route(api.rename)
+    add_route(api.episodes)
+    add_route(api.download)
+    add_route(api.cancel)
+    add_route(api.remove)
+    add_route(api.new)
+    add_route(api.old)
+    add_route(api.played)
+    add_route(api.registry)
+    add_route(api.version)
+    add_route(api.config)
+    add_route(api.set)
+    add_route(api.importurl)
+    add_route(api.importfile)
+    add_route(api.export)
+    add_route(api.save)
+    add_route(api.files, "/files")
+
 
 if __name__ == '__main__':
-    logger = logging.getLogger(__name__)
+    #logger = logging.getLogger(__name__)
+    httpd = Server(SERVER_ADDRESS, Handler)
+    if SSL:
+        httpd.socket = ssl.wrap_socket(httpd.socket, server_side=True, 
+            certfile="cert.pem")
     api = GpoApi(verbose)
-    #atexit.register(api._atexit)
-    add_apiurls()
-    httpd.run()
+    add_routes()
+    print("Starting HTTP server")
+    httpd.serve_forever()
