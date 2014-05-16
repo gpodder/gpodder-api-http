@@ -713,7 +713,6 @@ def add_routes():
     add_route(api.enable)
     add_route(api.disable)
     add_route(api.update)
-    add_route(api.scan)
     add_route(api.rewrite)
     add_route(api.rename)
     add_route(api.episodes)
